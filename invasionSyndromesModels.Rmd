@@ -1,0 +1,726 @@
+---
+title: "Invasion Syndrome Models"
+author: "XXXXXX"
+date: "`r format(Sys.time(), '%Y-%m-%d')`"
+output:
+  html_document:
+    df_print: paged
+    toc: true
+    toc_depth: 3
+    toc_float: true
+---
+
+
+```{r, results= "hide"}
+# software packages
+library(parallel)
+
+# data wrangling and analysis
+library(tidyverse)
+library(naniar)
+library(randomForest)
+library(caret)
+library(ranger)
+library(broom)
+library(rsample)
+library(ModelMetrics)
+library(modEvA)
+library(PresenceAbsence)
+library(miceRanger, attach.required = TRUE)
+
+```
+
+# data management
+
+# invasion history
+Upload species recorded to have been unintetionally transported. For herps, the invasion histories are in the "./data/invasionHistory" folder
+
+```{r}
+invHis_accTrans <- read_csv(file.choose()) %>% 
+  distinct(scientificName_harmonise, .keep_all = TRUE)
+```
+
+
+Download and resolve the taxonomies of herpetofauna species with established alien populations: https://onlinelibrary.wiley.com/doi/full/10.1111/ddi.12617
+
+```{r}
+invHis_est <- read_csv(file.choose()) %>% 
+  rename("scientificName_harmonise" = "sciName_resolved")
+
+```
+
+
+
+# Invasion syndromes
+
+
+The code below performs the following tasks:
+
+1. Reads the imputed dataset.
+2. Fine-tunes and evaluates random forest models separately for unintentionally transported species and species with established alien populations.
+3. Writes evaluation scores, variable importance, and predictions to CSV files for further analysis.
+4. loops this process 100 times.
+
+```{r}
+# Specify the path of the folder containing the imputed traits and macroecological patterns.
+# This folder should be in the "./output/missRangeImp/" directory.
+imp_path <- list.files("./output/miceRangeImp/", full.names = TRUE)
+
+# Loop through each dataset for modeling invasion syndromes separately.
+for (i in 1:100) {
+  
+  message(paste0("Processing dataset ", i))
+  
+  # Read the data for the current iteration and ensure correct data types for columns.
+  data <- read.csv(imp_path[i]) %>% 
+    mutate(
+      Genus = as.factor(Genus),
+      Family = as.factor(Family),
+      Order = as.factor(Order),
+      habitat_mostFreq = as.factor(habitat_mostFreq),
+      Fos = as.logical(Fos),
+      Ter = as.logical(Ter),
+      Aqu = as.logical(Aqu),
+      Arb = as.logical(Arb),
+      Diu = as.logical(Diu),
+      Noc = as.logical(Noc),
+      Crepu = as.logical(Crepu),
+      Dir = as.logical(Dir),
+      Lar = as.logical(Lar),
+      Viv = as.logical(Viv),
+      invHis_trans = as.logical(scientificName_harmonise %in% pull(invHis_accTrans, scientificName_harmonise)),
+      invHis_est = as.logical(scientificName_harmonise %in% pull(invHis_est, scientificName_harmonise))
+    )
+  
+  # Select dependent and optimal set of predictor variables.
+  data_t <- data %>% 
+    select(
+      invHis_trans, 
+      invHis_est,
+      scientificName_harmonise,
+      size = Body_size_mm,
+      clutchNumber = Reproductive_output_y,
+      area,
+      commonness = commonness_cleanedGBIF,
+      habitat_mostFreq, 
+      habitatBreadth,
+      Levins_norm,
+      PropSim,
+      humanTolerance_occs_median,
+      humanTolerance_occs_min,
+      humanTolerance_occs_max,
+      airport = airport_passangers,
+      allPorts = allPorts_outflow
+    ) %>% 
+    distinct(scientificName_harmonise, .keep_all = TRUE) %>% 
+    filter(across(.cols = everything(), .fns = ~!is.na(.x)))
+  
+  ######################################################
+  
+  ## Modelling invasion syndromes of unintentionally transported species
+  
+  # Prepare data for modeling.
+  mod_data_trans <- data_t %>% 
+    arrange(desc(invHis_trans)) %>% 
+    select(-c(invHis_est, scientificName_harmonise))
+  
+  # Fine-tune random forest model with cross-validation.
+  set.seed(i)
+  rf_trans_fineTune <- mod_data_trans %>% 
+    vfold_cv(v = 5) %>% 
+    mutate(
+      train = purrr::map(splits, ~training(.x)),
+      validate = purrr::map(splits, ~testing(.x))
+    ) %>% 
+    crossing(mtry = 1:10) %>% 
+    mutate(
+      model = purrr::map2(train, mtry, ~ranger(
+        formula = invHis_trans ~ .,
+        data = .x,
+        mtry = .y,
+        importance = "impurity",
+        probability = TRUE,
+        replace = TRUE,
+        num.trees = 1000,
+        case.weights = c(
+          rep(1, as.numeric(table(.x$invHis_trans)["TRUE"])),
+          rep(
+            as.numeric(table(.x$invHis_trans)["TRUE"]) /
+              as.numeric(table(.x$invHis_trans)["FALSE"]),
+            as.numeric(table(.x$invHis_trans)["FALSE"])
+          )
+        )
+      ))
+    ) %>% 
+    # Evaluate model performance
+    mutate(
+      validate_actual = purrr::map(validate, ~.x$invHis_trans),
+      validate_predict = purrr::map2(model, validate, ~predict(.x, .y)$predictions[, 1]),
+      validate_oob = purrr::map_dbl(model, ~.x$prediction.error),
+      validate_mae = purrr::map2_dbl(
+        validate_actual,
+        validate_predict,
+        ~ModelMetrics::mae(actual = .x, predicted = .y)
+      ),
+      validate_auc = purrr::map2_dbl(
+        validate_actual,
+        validate_predict,
+        ~ModelMetrics::auc(actual = .x, predicted = .y)
+      ),
+      validate_boyce = purrr::map2_dbl(
+        validate_actual,
+        validate_predict,
+        ~Boyce(obs = .x, pred = .y, plot = FALSE)$B
+      ),
+      validate_precision = purrr::map2_dbl(
+        validate_actual,
+        validate_predict,
+        ~ModelMetrics::precision(actual = .x, predicted = .y)
+      ),
+      validate_recall = purrr::map2_dbl(
+        validate_actual,
+        validate_predict,
+        ~ModelMetrics::recall(actual = .x, predicted = .y)
+      ),
+      validate_F1 = purrr::map2_dbl(
+        validate_actual,
+        validate_predict,
+        ~ModelMetrics::f1Score(actual = .x, predicted = .y)
+      )
+    ) %>% 
+    # Summarize model performance
+    select(
+      mtry,
+      validate_oob,
+      validate_mae,
+      validate_auc,
+      validate_boyce,
+      validate_precision,
+      validate_recall,
+      validate_F1
+    ) %>% 
+    group_by(mtry) %>% 
+    summarise(across(
+      validate_oob:validate_F1,
+      list(mean = mean, sd = sd)
+    ))
+  
+  # Write the evaluation scores of the model with the best Boyce index to a CSV file.
+  write.csv(
+    rf_trans_fineTune %>% arrange(desc(validate_boyce_mean)) %>% slice(1),
+    paste0("./output/rf_fineTune/rf_finetune_trans_fineTune_", i, ".csv")
+  )
+  
+  # Get the mtry value of the model with the best Boyce index.
+  rf_trans_fineTune_mtry <- rf_trans_fineTune %>% 
+    arrange(desc(validate_boyce_mean)) %>% 
+    slice(1) %>% 
+    pull(mtry)
+  
+  # Re-run the model using the best mtry value.
+  rf_trans <- ranger(
+    invHis_trans ~ .,
+    data = mod_data_trans,
+    importance = "impurity",
+    probability = TRUE,
+    mtry = rf_trans_fineTune_mtry
+  )
+  
+  # Write variable importance to a CSV file.
+  data.frame(varImp = rf_trans$variable.importance) %>% 
+    rownames_to_column("var") %>% 
+    arrange(desc(varImp)) %>% 
+    write_csv2(paste0("./output/rf_pred/rf_finetune_trans_varImp_", i, ".csv"))
+  
+  # Prediction to species worldwide.
+  rf_pred_trans <- data_t %>% 
+    cbind(data.frame(pred_trans = round(predict(rf_trans, data_t, type = "response")$predictions[, 1], 2))) %>% 
+    select(pred_trans, invHis_trans, scientificName_harmonise)
+  
+  # Calculate threshold for prediction.
+  trans_thresh <- optimal.thresholds(DATA = data.frame(
+    plot_ID = 1:length(rf_pred_trans[,"invHis_trans"]),
+    observed = rf_pred_trans[,"invHis_trans"],
+    fitted = rf_pred_trans[,"pred_trans"]
+  )) %>% 
+    filter(Method == "Sens=Spec") %>% 
+    pull(fitted)
+  
+  ######################################################
+  
+  ## Modelling invasion syndromes of species with established alien populations
+  
+  # Prepare data for modeling.
+  mod_data_est <- data_t %>% 
+    filter(invHis_trans == 1 | invHis_est == 1) %>% 
+    arrange(desc(invHis_est)) %>% 
+    select(-c(invHis_trans, scientificName_harmonise)) %>% 
+    droplevels()
+  
+  # Fine-tune random forest model with cross-validation.
+  set.seed(i)
+  rf_est_fineTune <- mod_data_est %>% 
+    vfold_cv(v = 5) %>% 
+    mutate(
+      train = purrr::map(splits, ~training(.x)),
+      validate = purrr::map(splits, ~testing(.x))
+    ) %>% 
+    crossing(mtry = 1:10) %>% 
+    mutate(
+      model = purrr::map2(train, mtry, ~ranger(
+        formula = invHis_est ~ .,
+        data = .x,
+        mtry = .y,
+        importance = "impurity",
+        probability = TRUE,
+        replace = TRUE,
+        num.trees = 1000,
+        case.weights = c(
+          rep(1, as.numeric(table(.x$invHis_est)["TRUE"])),
+          rep(
+            as.numeric(table(.x$invHis_est)["TRUE"]) /
+              as.numeric(table(.x$invHis_est)["FALSE"]),
+            as.numeric(table(.x$invHis_est)["FALSE"])
+          )
+        )
+      ))
+    ) %>% 
+    # Evaluate model performance
+    mutate(
+      validate_actual = purrr::map(validate, ~.x$invHis_est),
+      validate_predict = purrr::map2(model, validate, ~predict(.x, .y)$predictions[, 1]),
+      validate_oob = purrr::map_dbl(model, ~.x$prediction.error),
+      validate_mae = purrr::map2_dbl(
+        validate_actual,
+        validate_predict,
+        ~ModelMetrics::mae(actual = .x, predicted = .y)
+      ),
+      validate_auc = purrr::map2_dbl(
+        validate_actual,
+        validate_predict,
+        ~ModelMetrics::auc(actual = .x, predicted = .y)
+      ),
+      validate_boyce = purrr::map2_dbl(
+        validate_actual,
+        validate_predict,
+        ~Boyce(obs = .x, pred = .y, plot = FALSE)$B
+      ),
+      validate_precision = purrr::map2_dbl(
+        validate_actual,
+        validate_predict,
+        ~ModelMetrics::precision(actual = .x, predicted = .y)
+      ),
+      validate_recall = purrr::map2_dbl(
+        validate_actual,
+        validate_predict,
+        ~ModelMetrics::recall(actual = .x, predicted = .y)
+      ),
+      validate_F1 = purrr::map2_dbl(
+        validate_actual,
+        validate_predict,
+        ~ModelMetrics::f1Score(actual = .x, predicted = .y)
+      )
+    ) %>% 
+    # Summarize model performance
+    select(
+      mtry,
+      validate_oob,
+      validate_mae,
+      validate_auc,
+      validate_boyce,
+      validate_precision,
+      validate_recall,
+      validate_F1
+    ) %>% 
+    group_by(mtry) %>% 
+    summarise(across(
+      validate_oob:validate_F1,
+      list(mean = mean, sd = sd)
+    ))
+  
+  # Write the evaluation scores of the model with the best Boyce index to a CSV file.
+  write.csv(
+    rf_est_fineTune %>% arrange(desc(validate_boyce_mean)) %>% slice(1),
+    paste0("./output/rf_fineTune/rf_finetune_est_fineTune_", i, ".csv")
+  )
+  
+  # Get the mtry value of the model with the best Boyce index.
+  rf_est_fineTune_mtry <- rf_est_fineTune %>% 
+    arrange(desc(validate_boyce_mean)) %>% 
+    slice(1) %>% 
+    pull(mtry)
+  
+  # Re-run the model using the best mtry value.
+  rf_est <- ranger(
+    invHis_est ~ .,
+    data = mod_data_est,
+    importance = "impurity",
+    probability = TRUE,
+    mtry = rf_est_fineTune_mtry
+  )
+  
+  # Write variable importance to a CSV file.
+  data.frame(varImp = rf_est$variable.importance) %>% 
+    rownames_to_column("var") %>% 
+    arrange(desc(varImp)) %>% 
+    write_csv2(paste0("./output/rf_pred/rf_finetune_est_varImp_", i, ".csv"))
+  
+  # Prediction to species worldwide.
+  est_pred_data <- data_t %>% 
+    filter(invHis_trans == 1 | invHis_est == 1)
+  
+  rf_pred_est <- est_pred_data %>% 
+    cbind(data.frame(pred_est = round(predict(rf_est, est_pred_data, type = "response")$predictions[, 1], 2))) %>% 
+    relocate(pred_est) %>% 
+    select(pred_est, invHis_est, scientificName_harmonise)
+  
+  # Calculate threshold for prediction.
+  est_thresh <- optimal.thresholds(DATA = data.frame(
+    plot_ID = 1:length(rf_pred_est[,"invHis_est"]),
+    observed = rf_pred_est[,"invHis_est"],
+    fitted = rf_pred_est[,"pred_est"]
+  )) %>% 
+    filter(Method == "Sens=Spec") %>% 
+    pull(fitted)
+  
+  # Apply threshold to prediction.
+  rf_pred_est <- data_t %>% 
+    cbind(data.frame(pred_est = round(predict(rf_est, data_t, type = "response")$predictions[, 1], 2))) %>% 
+    relocate(pred_est) %>% 
+    select(pred_est, invHis_est, scientificName_harmonise)
+  
+  ## Compile predictions of both models.
+  rf_pred_trans %>% 
+    mutate(pred_trans_thres = pred_trans >= trans_thresh) %>% 
+    left_join(
+      rf_pred_est %>% 
+        mutate(pred_est_thres = pred_est >= est_thresh),
+      by = c("scientificName_harmonise")
+    ) %>% 
+    relocate(
+      scientificName_harmonise,
+      .after = pred_est_thres
+    ) %>% 
+    write_csv2(paste0("./output/rf_pred/rf_finetune_pred_", i, ".csv"))
+  
+  message(paste0("End processing dataset ", i, "\n"))
+  
+}
+
+```
+
+
+
+# Pooling results
+
+
+```{r}
+# This section finds the file paths of prediction files that contain the pattern "rf_finetune_pred"
+# in the "./output/rf_pred" directory and stores them in the pred_filepath variable.
+pred_filepath <- grep(list.files("./output/rf_pred", full.names = TRUE),
+                      pattern = "rf_finetune_pred", 
+                      value = TRUE)
+
+# Initialize an empty data frame to store the aggregated prediction summaries.
+pred_summary <- data.frame()
+
+# Iterate over each file path in pred_filepath.
+for (i in 1:100) {
+  # Read each CSV file into a temporary data frame and append it to pred_summary.
+  pred_summary <- bind_rows(pred_summary, read.csv2(pred_filepath[i])) 
+}
+
+# This section aggregates the predictions by species and computes summary statistics.
+pred_summary <- pred_summary %>% 
+  # Group the data by species names (scientificName and scientificName_harmonise).
+  group_by(scientificName_harmonise) %>% 
+  summarise(pred_trans_thres = sum(pred_trans_thres),
+            pred_trans_mean = mean(pred_trans),
+            pred_trans_sd = sd(pred_trans),
+            pred_est_thres = sum(pred_est_thres),
+            pred_est_mean = mean(pred_est),
+            pred_est_sd = sd(pred_est)
+  # Summarize the predictions:
+  # - pred_trans_thres: total count of predictions meeting a threshold for unintentionally transported species
+  # - pred_trans_mean: mean prediction for unintentionally transported species
+  # - pred_trans_sd: standard deviation of predictions for unintentionally transported species
+  # - pred_est_thres: total count of predictions meeting a threshold for established alien populations
+  # - pred_est_mean: mean prediction for established alien populations
+  # - pred_est_sd: standard deviation of predictions for established alien populations            
+            ) %>% 
+  # Join additional information about the species (invHis_trans:Order) from the data_t data frame.
+  left_join(
+    data_t %>% 
+    select(invHis_trans:scientificName_harmonise), 
+    by = "scientificName_harmonise"
+    )
+
+# Write the aggregated prediction summary data frame to a CSV file.
+pred_summary %>% 
+  write_csv2("./output/rf_finetune_pred_summary.csv")
+
+```
+
+
+
+# variable importance
+
+## invasion syndrome model of unintetionally transported and introduced species
+
+
+```{r}
+# Find file paths of variable importance files for predictions related to unintentionally transported species.
+trans_imp_filepath <- grep(list.files("./output/rf_pred", full.names = TRUE),
+                           pattern = "rf_finetune_trans_varImp_", 
+                           value = TRUE)
+
+# Initialize an empty data frame to store the aggregated variable importance summaries.
+trans_imp_summary <- data.frame()
+
+# Iterate over each file path in trans_imp_filepath.
+for (i in 1:100) {
+  # Read each CSV file into a temporary data frame and append it to trans_imp_summary.
+  trans_imp_summary <- bind_rows(trans_imp_summary, read.csv2(trans_imp_filepath[i])) 
+}
+
+# Compute summary statistics for variable importance across all iterations.
+trans_imp_summary <- trans_imp_summary %>% 
+  # Group the data by variable names (var).
+  group_by(var) %>% 
+  summarise(varImp_mean = mean(varImp),
+            varImp_sd = sd(varImp)
+  # Summarize the variable importance:
+  # - varImp_mean: mean variable importance
+  # - varImp_sd: standard deviation of variable importance            
+            ) %>% 
+  # Arrange the summary data in descending order of mean variable importance.
+  arrange(desc(varImp_mean))
+
+# Write the summarized variable importance data frame to a CSV file.
+trans_imp_summary %>% 
+  write_csv2("./output/finetune_trans_varimp_summary.csv")
+
+```
+
+## invasion syndrome model of species with established alien populations
+
+```{r}
+# Find file paths of variable importance files for predictions related to species with established alien populations.
+est_imp_filepath <- grep(list.files("./output/rf_pred", full.names = TRUE),
+                         pattern = "rf_finetune_est_varImp_", 
+                         value = TRUE)
+
+# Initialize an empty data frame to store the aggregated variable importance summaries.
+est_imp_summary <- data.frame()
+
+# Iterate over each file path in est_imp_filepath.
+for (i in 1:100) {
+  # Read each CSV file into a temporary data frame and append it to est_imp_summary.
+  est_imp_summary <- bind_rows(est_imp_summary, read.csv2(est_imp_filepath[i])) 
+}
+
+# Compute summary statistics for variable importance across all iterations.
+est_imp_summary <- est_imp_summary %>% 
+  # Group the data by variable names (var).
+  group_by(var) %>% 
+  summarise(varImp_mean = mean(varImp),
+            varImp_sd = sd(varImp)
+  # Summarize the variable importance:
+  # - varImp_mean: mean variable importance
+  # - varImp_sd: standard deviation of variable importance            
+            ) %>% 
+  # Arrange the summary data in descending order of mean variable importance.
+  arrange(desc(varImp_mean))
+
+# Write the summarized variable importance data frame to a CSV file.
+est_imp_summary %>% 
+  write_csv2("./output/finetune_est_varimp_summary.csv")
+
+```
+
+
+
+# model evaluation statistics
+
+## invasion syndrome model of unintetionally transported and introduced species
+
+
+```{r}
+# Find file paths of evaluation files related to predictions for unintentionally transported species.
+trans_eval_filepath <- grep(list.files("./output/rf_fineTune", full.names = TRUE),
+                            pattern = "rf_finetune_trans_fineTune", 
+                            value = TRUE)
+
+# Initialize an empty data frame to store the aggregated evaluation summaries.
+trans_eval_summary <- data.frame()
+
+# Iterate over each file path in trans_eval_filepath.
+for (i in 1:100) {
+  # Read each CSV file into a temporary data frame and append it to trans_eval_summary.
+  trans_eval_summary <- bind_rows(trans_eval_summary,
+                                  read.csv2(trans_eval_filepath[i], sep = ",")) 
+}
+
+# Perform data wrangling and summarization on trans_eval_summary.
+trans_eval_summary <- trans_eval_summary %>% 
+  # Remove columns 'X' and 'mtry'.
+  select(-c(X, mtry)) %>% 
+  # Reshape the data frame to long format.
+  pivot_longer(cols = everything(), 
+               names_to = "metrics", 
+               values_to = "val") %>% 
+  # Convert 'val' column to numeric.
+  mutate(val = as.numeric(val)) %>% 
+  # Filter rows containing "mean" in the 'metrics' column.
+  filter(grepl("mean", metrics)) %>% 
+  # Group the data by 'metrics'.
+  group_by(metrics) %>% 
+  # Calculate mean and standard deviation for each metric.
+  summarise(mean = mean(val),
+            sd = sd(val)) %>% 
+  # Remove "_mean" from 'metrics'.
+  mutate(metrics = str_remove(metrics, "validate_")) %>%
+  mutate(metrics = str_remove(metrics, "_mean"))
+
+# Write the summarized evaluation metrics to a CSV file.
+trans_eval_summary %>% 
+  write_csv2("./output/finetune_trans_eval_summary.csv")
+
+
+```
+
+## invasion syndrome model of species with established alien populations
+
+
+```{r}
+# Find file paths of evaluation files related to predictions for species with established alien populations.
+est_eval_filepath <- grep(list.files("./output/rf_fineTune", full.names = TRUE),
+                          pattern = "rf_finetune_est_fineTune", 
+                          value = TRUE)
+
+# Initialize an empty data frame to store the aggregated evaluation summaries.
+est_eval_summary <- data.frame()
+
+# Iterate over each file path in est_eval_filepath.
+for (i in 1:100) {
+  # Read each CSV file into a temporary data frame and append it to est_eval_summary.
+  est_eval_summary <- bind_rows(est_eval_summary,
+                                read.csv2(est_eval_filepath[i], sep = ",")) 
+}
+
+# Perform data wrangling and summarization on est_eval_summary.
+est_eval_summary <- est_eval_summary %>% 
+  # Remove columns 'X' and 'mtry'.
+  select(-c(X, mtry)) %>% 
+  # Reshape the data frame to long format.
+  pivot_longer(cols = everything(), 
+               names_to = "metrics", 
+               values_to = "val") %>% 
+  # Convert 'val' column to numeric.
+  mutate(val = as.numeric(val)) %>% 
+  # Filter rows containing "mean" in the 'metrics' column.
+  filter(grepl("mean", metrics)) %>% 
+  # Group the data by 'metrics'.
+  group_by(metrics) %>% 
+  # Calculate mean and standard deviation for each metric.
+  summarise(mean = mean(val),
+            sd = sd(val)) %>% 
+  # Remove "_mean" from 'metrics'.
+  mutate(metrics = str_remove(metrics, "validate_")) %>%
+  mutate(metrics = str_remove(metrics, "_mean"))
+
+# Write the summarized evaluation metrics to a CSV file.
+est_eval_summary %>% 
+  write_csv2("./output/finetune_est_eval_summary.csv")
+
+```
+
+# Computing Extrapolation uncertainty
+
+```{r}
+# Specify the path of the folder containing the imputed traits and macroecological patterns.
+# This folder should be in the "./output/missRangeImp/" directory.
+imp_path <- list.files("./output/miceRangeImp", full.names = TRUE)
+
+# Initialize an empty data frame to store the results of MESS analysis.
+amphibia_MESS <- data.frame()
+
+# Iterate over each dataset in the folder.
+for (i in 1:100) {
+
+  message(paste0("processing dataset ", i))
+ 
+  # Read the data from the CSV file in the current dataset.
+  data <- read.csv(imp_path[i]) %>% 
+    # Convert certain columns to factors or logicals as required.
+    mutate(habitat_mostFreq = as.factor(habitat_mostFreq),
+           Fos = as.logical(Fos),
+           Ter = as.logical(Ter),
+           Aqu = as.logical(Aqu),
+           Arb = as.logical(Arb),
+           Diu = as.logical(Diu),
+           Noc = as.logical(Noc),
+           Crepu = as.logical(Crepu),
+           Dir = as.logical(Dir),
+           Lar = as.logical(Lar),
+           Viv = as.logical(Viv))  %>% 
+    # Determine invasion history based on certain conditions.
+    mutate(invHis_trans = as.logical(scientificName_harmonise %in% pull(invHis_accTrans, scientificName_harmonise)),
+           invHis_est = as.logical(scientificName_harmonise %in% pull(invHis_est, scientificName_harmonise)))
+
+  # Select relevant columns for analysis.
+  data_t <- data %>% 
+    select(
+           invHis_trans,
+           invHis_est,
+           scientificName_harmonise,
+           Diu,
+           Noc,
+           Crepu,
+           size = Body_size_mm,
+           clutchNumber = Reproductive_output_y,
+           commonness = commonness_cleanedGBIF,
+           habitat_mostFreq, 
+           habitatBreadth,
+           Levins_norm,
+           PropSim,
+           humanTolerance_occs_median,
+           humanTolerance_occs_min,
+           humanTolerance_occs_max,
+           airport = airport_passangers,
+           allPorts = allPorts_outflow
+           ) %>% 
+    # Retain only unique records.
+    distinct(scientificName_harmonise, .keep_all = TRUE) %>% 
+    # Remove rows with any NA values.
+    filter(across(.cols = everything(), .fns = ~!is.na(.x)))
+
+  # Filter data to include only species with established alien populations.
+  data_est_t <- data_t %>% 
+    filter(invHis_trans == TRUE)
+
+  # Perform MESS analysis on the filtered data.
+  amphibia_MESS <- MESS(V = data_est_t %>% 
+                         dplyr::select(size, clutchNumber, commonness, habitatBreadth:allPorts),
+                       P = data_t %>% 
+                         dplyr::select(size, clutchNumber, commonness, habitatBreadth:allPorts)) %>% 
+    # Bind scientific names to the MESS results.
+    cbind(dplyr::select(data_t, scientificName_harmonise)) %>% 
+    # Filter MESS results where total uncertainty is less than 0.
+    filter(TOTAL < 0) %>% 
+    # Add a column to identify the imputation dataset.
+    mutate(impDataset = i) %>% 
+    # Append the MESS results to the overall MESS data frame.
+    rbind(amphibia_MESS)
+
+}
+
+# Aggregate MESS results by scientific name and measure of divergence.
+amphibia_MESS %>% 
+  group_by(scientificName_harmonise, MoD) %>% 
+  summarise(n = n()) %>% 
+  # Write the summarized MESS results to a CSV file.
+  write_csv("./output/extrapolationUncertainty.csv")
+
+
+```

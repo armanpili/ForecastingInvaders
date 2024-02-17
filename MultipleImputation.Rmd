@@ -1,0 +1,134 @@
+---
+title: "Multiple Imputation"
+author: "XXXXXXXXXXXXXXXXXXXXXXXXXX"
+date: "`r format(Sys.time(), '%Y-%m-%d')`"
+output:
+  html_document:
+    df_print: paged
+    toc: true
+    toc_depth: 3
+    toc_float: true
+---
+
+
+```{r, results= "hide"}
+# software packages
+library(parallel)
+
+# data wrangling and analysis
+library(tidyverse)
+library(naniar)
+
+# miceRanger
+library(miceRanger, attach.required = TRUE)
+
+```
+
+
+# upload data
+
+## macroecological patterns
+
+```{r}
+macroecologicalPatterns <- 
+  left_join(
+    read.csv(file.choose()), # load commonness
+    read_csv(file.choose()), # load habitatGeneralism
+    by = "scientificName_harmonise"
+  ) %>% 
+  left_join(
+    read_csv(file.choose()), # load humanTolerance
+    by = "scientificName_harmonise"
+  ) %>% 
+  left_join(
+    read_csv(file.choose()), # load interceptedPorts
+    by = "scientificName_harmonise"
+  ) %>% 
+  left_join(
+    read_csv(file.choose()), # load geographicRangeSize
+    by = "scientificName_harmonise"
+  )
+# make sure to only select scientificName, scientificName_harmonise, and the desired macroecological patterns. 
+# make sure the data type of columns are numerical, integer, logical, or factors; no characters!
+```
+
+## traits with PEM
+
+You should have written this as "./input/traits_wPEM.csv"
+
+```{r}
+traits <- read_csv(file.choose()) %>% 
+  select(-c(...1))
+
+# make sure to only select scientificName, scientificName_harmonise, and the desired traits. 
+# make sure the data type of columns are numerical, integer, logical, or factors; no characters!
+```
+
+
+
+# imputation
+
+
+```{r}
+# prepare the data  
+temp_phylo_imp <-  macroecologicalPatterns%>% 
+  left_join(traits,
+            by = "scientificName_harmonise") %>% 
+  bind_shadow() 
+
+# indicate which variables (X1:X...) will be used to predict the imputation of which variables (X2).
+
+v <- list(
+  # for macroecological patterns, use other macroecological patterns only. For example:
+  commonness_rawGBIF = c(names(temp_phylo_imp)[c(3:24)]),
+  # for life-history and ecological traits, use other life-history and ecological traits + family + respective PEM eigenvector. For example:
+  Fos = c(names(temp_phylo_imp)[c(30:40, # other traits
+                                  26, # family
+                                  42:58) # Optimisation showed that "Fos" is best predicted with the first 17 PEM eigenvectors
+                                ]) 
+  # Do this for the rest of the variables
+  )
+
+# parallel
+cl <- makeCluster(5)
+registerDoParallel(cl)
+
+imp_model <- miceRanger(data = temp_phylo_imp,
+                            m = 100,
+                            maxiter = 5,
+                            vars = v,
+                            valueSelector = "meanMatch",
+                            verbose = FALSE,
+                            parallel = TRUE,
+                            returnModels = TRUE)
+
+stopCluster(cl)
+
+# oob
+
+temp_oob <- imp_model$finalError
+write_csv(temp_oob, "./output/miceRangeError/miceRangeError.csv")
+
+
+# imputed data
+
+for (j in c(1:100)) {
+temp_impData <- completeData(imp_model)[[paste0("Dataset_", j)]] %>% 
+  mutate(miceRange_imp = j)
+write_csv(temp_impData, paste0("./output/miceRangeImp/miceRangeImp_", j, ".csv"))
+}
+
+
+# importance
+
+for (k in c(1:100)) {
+temp_importance <- imp_model$finalImport[[paste0("Dataset_", k)]]  
+write_csv(temp_importance, paste0("./output/miceRangeImportance/miceRangeImportance_", k, ".csv"))
+
+}
+
+```
+
+
+
+

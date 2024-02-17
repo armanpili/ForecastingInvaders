@@ -1,0 +1,946 @@
+---
+title: "Computing Macroecological Patterns"
+author: "XXXXXXXXXXXXXXXXXX"
+date: "`r format(Sys.time(), '%Y-%m-%d')`"
+output:
+  html_document:
+    df_print: paged
+    toc: true
+    toc_depth: 3
+    toc_float: true
+---
+
+### load libraries
+
+```{r, results= "hide"}
+# Load necessary software packages
+library(rmarkdown)  # For creating dynamic documents
+
+# Data wrangling and analysis
+library(tidyverse)  # Collection of packages for data manipulation and visualization
+library(ade4)       # Analysis of Ecological Data: functions for multivariate analysis
+library(inlmisc)    # Miscellaneous functions for Bayesian models
+library(parallel)   # For parallel processing
+
+# Data download
+library(rgbif)      # Interface to the Global Biodiversity Information Facility API
+library(countrycode) # Convert country names to/from ISO country codes
+
+# Spatial data handling
+library(sf)         # Simple Features for R: handling spatial data
+library(terra)      # For working with raster data
+library(maptools)   # Tools for reading and handling spatial objects
+
+
+# database harmonisation
+library(taxize)            # For taxonomic data retrieval and manipulation
+library(AmphiNom)          # AmphiNom: Cleaning amphibian occurrence data
+
+# Spatial data cleaning
+library(passport)          # Tools for cleaning geographical coordinates
+library(CoordinateCleaner) # Cleaning geographical coordinates and taxonomic names
+
+# Species distribution modelling packages
+library(biomod2)   # Species distribution modeling
+library(ENMeval)   # Evaluation of Ecological Niche Models
+
+
+```
+
+
+This script was used to quantify the macroecological patterns of Amphibians. But the script is generally transferable to other taxa.
+
+Examples of the output files produced from this script can be downloaded in XXXXXXXXXXXXXXXXX.
+
+# Preparing data
+
+## Range map
+
+### Step 1 : Upload the range maps. 
+
+Download rangemaps and store this in "./data/rangeMaps" folder. The range maps should ideally be a an simple features class (package "sf"). Range maps will be used in computing all macroecological patterns.
+```{r}
+rangeMaps <- st_read(choose.files())
+```
+
+### Step 2 : Harmonise the taxonomy of the species
+
+```{r}
+# pull the scientific names column
+rangeMaps_spp <- rangeMaps %>% 
+  pull(sci_name) %>% 
+  unique()
+
+# update the taxonomies using amphinom::harmoniseSync. This uses the Amphibian Species of the Wolrd taxonomies (https://amphibiansoftheworld.amnh.org/)
+rangeMaps_spp_resolve <- harmoniseSync(query = rangeMaps_spp) %>% 
+  distinct(query, .keep_all = TRUE) %>% 
+  mutate(match_count = str_count(harmonise_names, "\\w+")) %>% 
+  mutate(scientificName_harmonise = if_else(match_count == 2, harmonise_names, query)) %>% 
+  rename("binomial" = "query") %>% 
+  dplyr::select(binomial, scientificName_harmonise)
+
+# update the "rangeMaps" shapefile by merging the harmonised taxonomies.
+rangeMaps <- rangeMaps %>% 
+  left_join(rangeMaps_spp_resolve,
+            by = c("sci_name" = "binomial"))%>%    
+  relocate(scientificName_harmonise)
+
+```
+
+
+### Step 3 : computing geographic range from occurrence data
+
+But some species do not have range maps. So you have to produce range maps from occurrence data. 
+
+
+
+
+```{r}
+# Download the occurrence data from GBIF. Upload the occurrence data. Put the occurrence data in the "./data/occurrenceData/ folder.
+
+occs <- read.delim(file = file.choose(),
+                            header = TRUE,
+                            sep = "\t") %>% 
+  rename("scientificName" = "species")
+
+# Clean the occurrence data.
+
+occs <- occs %>%
+  dplyr::select(scientificName,
+                decimalLongitude,
+                decimalLatitude,
+                countryCode,
+                individualCount,
+                gbifID,
+                family, 
+                taxonRank, 
+                coordinateUncertaintyInMeters, 
+                year,
+                basisOfRecord, 
+                institutionCode) %>% 
+  rename("decimallongitude" = "decimalLongitude",
+         "decimallatitude" = "decimalLatitude") %>%
+  mutate_all(na_if, "") %>% 
+  mutate(decimallongitude = as.numeric(decimallongitude),
+         decimallatitude = as.numeric(decimallatitude)) %>% 
+  filter(!is.na(scientificName_harmonise),
+         !is.na(decimallongitude),
+         !is.na(decimallatitude)) %>% 
+  cc_dupl()  %>% 
+  cc_zero() %>% 
+  cc_equ() %>% 
+  cc_val() %>% 
+  cc_sea() %>% 
+  cc_cap(geod = FALSE, buffer = 0.0416) %>% 
+  cc_cen(geod = FALSE, buffer = 0.0416) %>% 
+  cc_gbif(geod = FALSE, buffer = 0.0416) %>% 
+  cc_inst(geod = FALSE, buffer = 0.0416) %>% 
+  filter(coordinateUncertaintyInMeters  < 5000  | is.na(coordinateUncertaintyInMeters))
+
+# harmonise occurrence data
+occs_spp <- occs %>% 
+  pull(scientificName) %>% 
+  unique()
+
+
+temp <- harmoniseSync(query = occs_spp)
+occs_spp_resolve <- temp %>% 
+  distinct(query, .keep_all = TRUE) %>% 
+  mutate(match_count = str_count(harmonise_names, "\\w+")) %>% 
+  mutate(scientificName_harmonise = if_else(match_count == 2, harmonise_names, query)) %>% 
+  rename("binomial" = "query") %>% 
+  dplyr::select(binomial ,scientificName_harmonise)
+
+
+occs <- occs %>% 
+  left_join(occs_spp_resolve,
+            by = c("scientificName" = "binomial"))%>%    
+  relocate(scientificName_harmonise)
+
+
+# additional range maps
+
+
+temp_occs_data <- occs %>% 
+  filter(!(scientificName_harmonise %in% pull(st_drop_geometry(geographicRange), scientificName_harmonise))) 
+temp_spp <- temp_occs_data %>% 
+  distinct(scientificName_harmonise) %>% 
+  pull(scientificName_harmonise)
+
+# upload world map
+
+data(wrld_si)
+wm <- ne_download(scale = "large",
+                  type = "land",
+                  category = "physical",
+                  returnclass = "sf") %>% st_transform(crs = "+proj=longlat +datum=WGS84")
+
+# now make additional range maps
+
+i <- temp_spp[1]
+temp_occs <- temp_occs_data %>% 
+      filter(scientificName_harmonise == i) %>% 
+      st_as_sf(coords = c("decimallongitude", "decimallatitude"),
+                          crs = "+proj=longlat +datum=WGS84")
+temp_range <- st_buffer(x = temp_occs, 
+                            dist = 10000) %>%  # choose a buffer distance. I chose a 10km radius.
+    st_union() %>% 
+    st_make_valid() %>% 
+    st_intersection(st_make_valid(wm)) %>% 
+    st_union()
+
+temp_range <- st_sf(geometry = temp_range) %>% 
+  mutate(scientificName_harmonise = i)
+
+
+for (i in temp_spp[2:length(temp_spp)]) {
+message(paste0("running species ", i))
+  tryCatch({
+temp_occs <- temp_occs_data %>% 
+      filter(scientificName_harmonise == i) %>% 
+      st_as_sf(coords = c("decimallongitude", "decimallatitude"),
+                          crs = "+proj=longlat +datum=WGS84")
+temp_range_l <- st_buffer(x = temp_occs, 
+                            dist = 10000) %>% 
+    st_union() %>% 
+    st_make_valid() %>% 
+    st_intersection(st_make_valid(wm))
+
+temp_range_l <- st_sf(geometry = temp_range_l) %>% 
+  mutate(scientificName_harmonise = i)
+
+temp_range <- rbind(temp_range, temp_range_l)
+},
+ error = function(e){
+   message(paste0("error occurred for species ", i, ":\n"), e)
+ })
+}
+
+temp_range <- temp_range %>% 
+  rename("scientificName_harmonise")
+
+# update the rangemaps
+
+rangeMaps_more <- temp_range %>% 
+  left_join(
+    temp_occs_data %>% 
+    dplyr::select(scientificName_harmonise,
+                  family) %>% 
+    distinct()
+    )
+
+temp  <- st_area(rangeMaps_more)
+
+rangeMaps_more <- rangeMaps_more %>% 
+  bind_cols(data.frame(area = as.double(temp)))
+
+
+rangeMaps <- bind_rows(rangeMaps %>%  rename("area" = "SHAPE_Area"),
+                             rangeMaps_more) %>% 
+  st_make_valid()
+
+# write data with only geographic range in "./input/" folder
+
+write_csv(st_drop_geometry(rangeMaps) %>% 
+            select(scientificName_harmonise, area),
+          "./input/geographicRange.csv")
+
+# write the new range map in the input folder
+write_sf(rangeMaps,
+         "./input/rangeMap.shp")
+
+```
+
+## Human Footprint Maps
+
+Download human footprint raster from: https://sedac.ciesin.columbia.edu/data/set/wildareas-v3-2009-human-footprint
+Keep this in "./data/humanFootprint" folder
+```{r}
+# Read the raster file containing human footprint data for 2009
+HF_2009 <- rast(file.choose())
+
+# Set values greater than 50 to NA (assuming these are units indicating human impact)
+HF_2009[HF_2009 > 50] <- NA
+
+# Define a new raster with the same extent, resolution of 5000 units, and CRS as the original HF_2009 raster
+temp_r <- rast(extent = ext(HF_2009), resolution = 5000, crs = crs(HF_2009))
+
+# Resample the HF_2009 raster to match the resolution and extent of the new raster 'temp_r'
+HF_2009 <- resample(HF_2009, temp_r)
+
+# Project the HF_2009 raster to WGS84 coordinate reference system (CRS)
+HF_2009 <- project(HF_2009, "+proj=longlat +datum=WGS84")
+
+```
+
+
+
+## ecoregions
+
+Download shapefiles of ecoregions from Dinerstein et al. 2017: https://academic.oup.com/bioscience/article/67/6/534/3102935#supplementary-data
+Keep this file in "./data/ecoregions" folder
+
+```{r}
+ecoregions <- st_read(file.choose()) %>% 
+  st_make_valid()
+```
+
+
+
+### habitat shapefiles
+
+Download raster of ecoregions from Jung et al. 2020 : https://www.nature.com/articles/s41597-020-00599-8 
+Keep this file in the "./data/habtiats" folder
+
+```{r}
+habitat_lvl1 <- rast(file.choose())
+```
+
+
+# Commonness
+
+## Commonness raw
+
+
+```{r}
+# Download the occurrence data from GBIF. Upload the occurrence data. Put the occurrence data in the "./data/occurrenceData" folder.
+
+occs <- read.delim(file = file.choose(),
+                            header = TRUE,
+                            sep = "\t") %>% 
+  rename("scientificName" = "species")
+  left_join(occs_spp_resolve,
+            by = c("scientificName" = "binomial"))%>%    
+  relocate(scientificName_harmonise)
+
+# Compute the number of records per species. This only include species with geographic coordinates.
+
+commonness_raw <- occs %>% 
+ dplyr::select(scientificName_harmonise,
+                decimalLongitude,
+                decimalLatitude,
+                countryCode,
+                individualCount,
+                gbifID,
+                family, 
+                taxonRank, 
+                coordinateUncertaintyInMeters, 
+                year,
+                basisOfRecord, 
+                institutionCode) %>% 
+  rename("decimallongitude" = "decimalLongitude",
+         "decimallatitude" = "decimalLatitude") %>%
+  mutate_all(na_if, "") %>% 
+  mutate(decimallongitude = as.numeric(decimallongitude),
+         decimallatitude = as.numeric(decimallatitude)) %>% 
+  filter(!is.na(scientificName_harmonise),
+         !is.na(decimallongitude),
+         !is.na(decimallatitude)) %>% 
+  group_by(scientificName_harmonise) %>% 
+  summarise(commonness_rawGBIF = n())
+
+```
+
+## Commonness cleaned
+
+```{r}
+# Compute the number of high-quality records.
+
+commonness_cleaned <- occs %>%
+  dplyr::select(scientificName_harmonise,
+                decimalLongitude,
+                decimalLatitude,
+                countryCode,
+                individualCount,
+                gbifID,
+                family, 
+                taxonRank, 
+                coordinateUncertaintyInMeters, 
+                year,
+                basisOfRecord, 
+                institutionCode) %>% 
+  rename("decimallongitude" = "decimalLongitude",
+         "decimallatitude" = "decimalLatitude") %>%
+  mutate_all(na_if, "") %>% 
+  mutate(decimallongitude = as.numeric(decimallongitude),
+         decimallatitude = as.numeric(decimallatitude)) %>% 
+  filter(!is.na(scientificName_harmonise),
+         !is.na(decimallongitude),
+         !is.na(decimallatitude)) %>% 
+  cc_dupl()  %>% 
+  cc_zero() %>% 
+  cc_equ() %>% 
+  cc_val() %>% 
+  cc_sea() %>% 
+  cc_cap(geod = FALSE, buffer = 0.0416) %>% 
+  cc_cen(geod = FALSE, buffer = 0.0416) %>% 
+  cc_gbif(geod = FALSE, buffer = 0.0416) %>% 
+  cc_inst(geod = FALSE, buffer = 0.0416) %>% 
+  cc_iucn(range = rangeMaps) %>%
+  filter(coordinateUncertaintyInMeters  < 5000  | is.na(coordinateUncertaintyInMeters)) %>% 
+  group_by(scientificName_harmonise) %>% 
+  summarise(commonness_cleanedGBIF = n())
+
+```
+
+## Commonness thinned 
+
+
+```{r}
+# Compute the number of high-quality, geographically thinned records.
+# Geographic thinning reduces sampling bias/sampling pseudo-replicates.
+
+# Extract unique species names from the 'commonness_cleaned' dataframe
+temp <- commonness_cleaned %>% 
+  distinct(scientificName_harmonise) %>%          # Extract unique values of 'scientificName_harmonise'
+  arrange(scientificName_harmonise) %>%           # Arrange them in alphabetical order
+  pull(scientificName_harmonise)                  # Pull the 'species' column as a vector
+
+# Initialize an empty dataframe to store the results
+commonness_thinned <- data.frame()
+
+# Loop through each species
+for (i in temp) {
+  tryCatch(
+    {
+      # Filter data for the current species
+      i_sf <- commonness_cleaned %>% 
+        filter(scientificName_harmonise == i)
+      
+      # Convert spatial data to Simple Features
+      i_vect <- vect(i_sf,
+                     geom = c("decimallongitude", "decimallatitude"),
+                     crs = "+proj=longlat +datum=WGS84")
+      
+      # Convert Simple Features to raster
+      i_rast <- rast(i_vect)
+      
+      # Set resolution of the raster
+      res(i_rast) <- 0.0416
+      
+      # Extend the raster by 1 cell
+      i_rast  <- extend(i_rast, ext(i_rast) + 1)
+      
+      # Perform spatial thinning
+      i_thinned <- spatSample(i_vect,
+                              size = 1, 
+                              "random", 
+                              strata = i_rast) 
+      
+      # Summarize the thinned data and store it
+      commonness_thinned <- as.data.frame(i_thinned) %>%
+        group_by(scientificName_harmonise) %>% 
+        summarise(commonness_thinnedGBIF = n()) %>% 
+        rbind(commonness_thinned)
+    },
+    error = function(e){
+      message(paste0("Error occurred for species ", i, ":\n"), e)
+    }
+  )
+}
+
+
+```
+
+## the compiled commonness data
+
+```{r}
+commonness_df <- full_join(commonness_raw,
+                           commonness_cleaned) %>% 
+  full_join(commonness_thinned)
+
+# write this in input folder
+commonness_df %>% 
+  write_csv("./input/commonness.csv")
+```
+
+
+
+
+# Tolerance to human disturbance
+
+
+
+## humanTolerance_range
+
+
+```{r}
+## Compute human tolerance based on entire geographic range
+
+# Extract unique harmonized scientific names from the 'rangeMaps' dataframe
+temp_spp <- rangeMaps %>%
+  st_drop_geometry() %>%           # Drop geometry (spatial) information
+  pull(scientificName_harmonise) %>%  # Extract 'scientificName_harmonise' column
+  unique()                            # Keep only unique values
+
+# Initialize an empty dataframe to store the results
+humanTolerance_rast <- data.frame()
+
+# Loop through each species
+for (i in temp_spp) {
+  message(paste0("Running species ", i))
+  tryCatch(
+    {
+      # Filter rangeMaps for the current species
+      temp_range <- rangeMaps %>% 
+                    filter(scientificName_harmonise == i)
+      
+      # Mask HF_2009 raster with the range of the current species
+      temp_rast <- mask(HF_2009, temp_range)
+      
+      # Compute statistics (mean, median, range) for the masked raster
+      humanTolerance_rast <- cbind(global(temp_rast, fun = "mean", na.rm = TRUE),
+                                    global(temp_rast, fun = median, na.rm = TRUE),
+                                    global(temp_rast, fun = "range", na.rm = TRUE)) %>% 
+        rowid_to_column() %>%   # Add a column for row index
+        mutate(scientificName_harmonise = i) %>%   # Add a column for species name
+        dplyr::select(scientificName_harmonise,
+                      humanTolerance_rast_mean = mean, 
+                      humanTolerance_rast_median = global, 
+                      humanTolerance_rast_min = range, 
+                      humanTolerance_rast_max = max) %>%   # Select specific columns
+        # Round numeric columns to 2 decimal places
+        mutate(humanTolerance_rast_mean = round(humanTolerance_rast_mean, 2),
+               humanTolerance_rast_median = round(humanTolerance_rast_median, 2),
+               humanTolerance_rast_min = round(humanTolerance_rast_min, 2),
+               humanTolerance_rast_max = round(humanTolerance_rast_max, 2)) %>% 
+        rbind(humanTolerance_rast)   # Append results to the main dataframe
+    },
+    error = function(e){
+      message(paste0("Error occurred for species ", i, ":\n"), e)
+    }
+  )
+}
+
+
+```
+
+
+## Computing human tolerance on occurrence locations recorded from 2009 to present
+
+
+# humanTolerance_occs
+
+```{r}
+# Download the occurrence data from GBIF. Upload the occurrence data. Put the occurrence data in the "./data/occurrenceData" folder.
+
+occs <- read.delim(file = file.choose(),
+                            header = TRUE,
+                            sep = "\t") %>% 
+  rename("scientificName" = "species")
+
+# Clean the occurrence data.
+
+occs <- occs %>%
+  dplyr::select(scientificName,
+                decimalLongitude,
+                decimalLatitude,
+                countryCode,
+                individualCount,
+                gbifID,
+                family, 
+                taxonRank, 
+                coordinateUncertaintyInMeters, 
+                year,
+                basisOfRecord, 
+                institutionCode) %>% 
+  rename("decimallongitude" = "decimalLongitude",
+         "decimallatitude" = "decimalLatitude") %>%
+  mutate_all(na_if, "") %>% 
+  mutate(decimallongitude = as.numeric(decimallongitude),
+         decimallatitude = as.numeric(decimallatitude)) %>% 
+  filter(!is.na(species),
+         !is.na(decimallongitude),
+         !is.na(decimallatitude)) %>% 
+  cc_dupl()  %>% 
+  cc_zero() %>% 
+  cc_equ() %>% 
+  cc_val() %>% 
+  cc_sea() %>% 
+  cc_cap(geod = FALSE, buffer = 0.0416) %>% 
+  cc_cen(geod = FALSE, buffer = 0.0416) %>% 
+  cc_gbif(geod = FALSE, buffer = 0.0416) %>% 
+  cc_inst(geod = FALSE, buffer = 0.0416) %>% 
+  cc_iucn(range = rangeMaps) %>%
+  filter(coordinateUncertaintyInMeters  < 5000  | is.na(coordinateUncertaintyInMeters)) %>% 
+  left_join(occs_spp_resolve,
+            by = c("scientificName" = "binomial"))%>%    
+  relocate(scientificName_harmonise)
+
+
+
+temp_spp <- occs %>% 
+  distinct(scientificName_harmonise) %>%
+  arrange(scientificName_harmonise) %>% 
+  pull(scientificName_harmonise)
+
+# Computing human tolerance from occurrence locations
+
+# Initialize an empty dataframe to store the results
+humanTolerance_occs <- data.frame()
+
+# Loop through each species
+for (i in temp_spp) {
+  tryCatch(
+    {
+      message(paste0("Processing ", i))
+      
+      # Filter occurrence data for the current species since 2009
+      temp_sf <- occs %>% 
+        filter(scientificName == i,
+               year >= 2009)
+      
+      # Convert occurrence data to Simple Features
+      temp_vect <- vect(temp_sf,
+                        geom = c("decimallongitude", "decimallatitude"),
+                        crs = "+proj=longlat +datum=WGS84")
+      
+      # Convert Simple Features to raster
+      temp_rast <- rast(temp_vect)
+      
+      # Set resolution of the raster
+      res(temp_rast) <- 0.0416
+      
+      # Extend the raster by 1 cell
+      temp_rast  <- extend(temp_rast, ext(temp_rast) + 1)
+      
+      # Thinning occurrence data to a 5km radius distance
+      temp_thinned <- spatSample(temp_vect,
+                                  size = 1, 
+                                  "random", 
+                                  strata = temp_rast)
+      
+      # Extract human footprint data based on thinned occurrence locations
+      humanTolerance_occs <- terra::extract(HF_2009, temp_thinned) %>% 
+        as.data.frame() %>%
+        summarise(humanTolerance_occs_mean = round(mean(HFP2009_int, na.rm = TRUE), 2),
+                  humanTolerance_occs_median = round(median(HFP2009_int, na.rm = TRUE), 2),
+                  humanTolerance_occs_min = round(min(HFP2009_int, na.rm = TRUE), 2),
+                  humanTolerance_occs_max = round(max(HFP2009_int, na.rm = TRUE), 2)) %>% 
+        mutate(scientificName_harmonise = i) %>% 
+        relocate(scientificName_harmonise) %>% 
+        rbind(humanTolerance_occs)
+    },
+    error = function(e){
+      message(paste0("Error occurred for species ", i, ":\n"), e)
+    }
+  )
+}
+
+# Replace certain values with NA
+humanTolerance_occs <- humanTolerance_occs %>% 
+  replace_with_na_all(condition = ~.x %in% c("N/A", "-Inf", "Inf")) %>% 
+  mutate_all(function(x) ifelse(is.nan(x), NA, x))
+
+```
+
+
+## write the csv in the "./input/" folder
+
+```{r}
+# combine the human tolerance data from rasters and occurences
+
+humanTolerance <- full_join(humanTolerance_rast, humanTolerance_occs, by = c("species")) %>% 
+  replace_with_na_all(condition = ~.x %in% c("N/A", "-Inf", "Inf")) %>% 
+  mutate_all(function(x) ifelse(is.nan(x), NA, x))
+
+
+write_csv(humanTolerance, "./input/humanTolerance.csv")
+```
+
+
+
+# Access to ports
+
+## loading data
+
+### all transport ports
+
+You can download the data from The World Banks : https://datacatalog.worldbank.org/search/dataset/0038118/Global---International-Ports
+Keep file in "./data/ports" folder
+
+```{r}
+# Read the CSV file containing port data and convert it to a spatial dataframe
+allPorts <- st_as_sf(read_csv(file.choose()),
+                      coords = c("X", "Y"),  # Specify the column names for coordinates
+                      crs = 4326) %>%       # Specify the coordinate reference system (CRS)
+            # Add columns to identify different types of ports based on Function column values
+            mutate(
+              is_Port = if_else(str_sub(Function, 1, 1) == 1, TRUE, FALSE),
+              is_Rail = if_else(str_sub(Function, 2, 2) == 2, TRUE, FALSE),
+              is_Road = if_else(str_sub(Function, 3, 3) == 3, TRUE, FALSE),
+              is_Airport = if_else(str_sub(Function, 4, 4) == 4, TRUE, FALSE),
+              is_Postal = if_else(str_sub(Function, 5, 5) == 5, TRUE, FALSE),
+              is_MultimodalFunc = if_else(str_sub(Function, 6, 6) == 6, TRUE, FALSE),
+              is_FixedTransportFunc = if_else(str_sub(Function, 7, 7) == 7, TRUE, FALSE),
+              is_BorderCrossing = if_else(str_sub(Function, 8, 8) == "B", TRUE, FALSE)
+            ) %>%
+            st_make_valid()  # Make sure geometries are valid
+
+
+# Filter allPorts to create separate spatial dataframes for railPorts, roadPorts, portPorts, postalPorts, and borderCrossingPorts
+railPorts <- allPorts %>% 
+  filter(is_Rail == TRUE) %>%   # Filter for rows where is_Rail is TRUE
+  st_make_valid()               # Make sure geometries are valid
+
+roadPorts <- allPorts %>% 
+  filter(is_Road == TRUE) %>%   # Filter for rows where is_Road is TRUE
+  st_make_valid()               # Make sure geometries are valid
+
+portPorts <- allPorts %>% 
+  filter(is_Port == TRUE) %>%   # Filter for rows where is_Port is TRUE
+  st_make_valid()               # Make sure geometries are valid
+
+postalPorts <- allPorts %>% 
+  filter(is_Postal == TRUE) %>% # Filter for rows where is_Postal is TRUE
+  st_make_valid()               # Make sure geometries are valid
+
+borderCrossingPorts <- allPorts %>% 
+  filter(is_BorderCrossing == TRUE) %>%  # Filter for rows where is_BorderCrossing is TRUE
+  st_make_valid()                        # Make sure geometries are valid
+
+  
+```
+
+
+#### airports only
+
+You can download the data from The World Banks : https://datacatalog.worldbank.org/search/dataset/0038117/Global-Airports
+Keep filw in "./data/ports" folder
+
+```{r}
+# Read the CSV file containing airport data and convert it to a sf object
+airPorts <- st_as_sf(read_csv(file.choose()),   # Read the CSV file
+                     coords = c("Airport1Longitude", "Airport1Latitude"),   # Specify the columns containing longitude and latitude
+                     crs = 4326) %>%   # Specify the coordinate reference system (CRS) as WGS84 (EPSG code 4326)
+  st_make_valid()   # Make the spatial object valid (fix any invalid geometries)
+
+# The airport data is now stored in 'airPorts' as an sf object
+
+```
+
+
+
+## Computing ports within range
+
+
+```{r}
+## Computing ports within range
+
+# Extract unique harmonized scientific names from the 'rangeMaps' dataframe
+temp_spp <- rangeMaps %>%
+  pull(scientificName_harmonise) 
+
+# Define a function to count ports within range for a given species
+countPorts <- function(x){
+  tryCatch({
+    # Filter rangeMaps for the current species and make the geometry valid
+    temp_range <- rangeMaps %>% filter(scientificName_harmonise == x) %>% st_make_valid()
+    
+    # Initialize a vector to store port counts
+    temp_res <- rep(NA, 6)
+    
+    # Calculate the number of intersecting ports for different types of ports
+    temp_res[1] <- sum(unlist(st_intersects(airPorts, temp_range)))
+    temp_res[2] <- sum(unlist(st_intersects(allPorts, temp_range)))
+    temp_res[3] <- sum(unlist(st_intersects(railPorts, temp_range)))
+    temp_res[4] <- sum(unlist(st_intersects(roadPorts, temp_range)))
+    temp_res[5] <- sum(unlist(st_intersects(postalPorts, temp_range)))
+    temp_res[6] <- sum(unlist(st_intersects(borderCrossingPorts, temp_range)))
+    
+    # Return the result
+    return(temp_res)
+  },
+  error = function(e){
+    return(temp_res) # Return NA in case of error
+  },
+  warning = function(w){
+    return(temp_res) # Return NA in case of warning
+  }
+ )
+}
+
+# Initialize a cluster with 6 workers for parallel processing
+cl <- makeCluster(6)
+
+# Load required libraries into the cluster workers
+clusterEvalQ(cl, 
+             {library(dplyr)
+              library(sf)})
+              
+# Export necessary objects to the cluster workers
+clusterExport(cl, c("countPorts", 
+                    "rangeMaps",
+                    "airPorts",
+                    "allPorts",
+                    "railPorts",
+                    "roadPorts",
+                    "postalPorts",
+                    "borderCrossingPorts"))
+
+# Apply the countPorts function in parallel to each species
+temp_res <- clusterApplyLB(cl, temp_spp, countPorts)
+
+# Stop the cluster to release system resources
+stopCluster(cl)
+
+# Create a dataframe from the results and write it to a CSV file
+data.frame(scientificName_harmonise = temp_spp,
+           do.call(rbind, temp_res)) %>% 
+  rename("airport_range" = "X1",
+         "allPorts_range" = "X2",
+         "railPorts_range" = "X3",
+         "roadPorts_range" = "X4",
+         "postalPorts_range" = "X5",
+         "borderCrossingPorts_range" = "X6") %>% 
+  distinct(scientificName_harmonise, .keep_all = TRUE) %>% 
+  write_csv("./input/portsIntercepted.csv")
+
+
+```
+
+
+# Habitat generalism
+
+the process first involves generating a grid of 5km x 5km cells based on the geographic ranges of the species
+
+```{r}
+spp_list <- rangeMaps %>%  
+  st_drop_geometry() %>% 
+  arrange(scientificName_harmonise) %>% 
+  distinct(scientificName_harmonise) %>% 
+  pull(scientificName_harmonise) 
+
+
+habitatGeneralism_range <- function(x) {
+  # Extract the species name for the current iteration
+  temp_spp <- spp_list[x]
+  
+  # Initialize a vector to store the results
+  temp_res <- rep(NA, 5)
+  
+  tryCatch({
+    # Attempt to execute the following code block
+    
+    # Filter rangeMaps for the current species
+    temp_range <- rangeMaps %>% 
+      filter(scientificName_harmonise == temp_spp)
+    
+    # Extract available habitats represented by ecoregions
+    temp_ecoregions <- ecoregions[temp_range,] %>% 
+      st_make_valid()
+    
+    # Extract occupied habitats (among available) by cropping habitat_lvl1 with the species range
+    temp_habitat <- terra::crop(habitat_lvl1, vect(temp_range), mask = TRUE) %>%
+      terra::mask(temp_range)
+    
+    # Extract available habitats by cropping habitat_lvl1 with the available ecoregions
+    temp_available <- terra::crop(habitat_lvl1, vect(temp_ecoregions), mask = TRUE) %>%
+      terra::mask(temp_ecoregions)
+    
+    # Create a frequency table for occupied and available habitats
+    temp_table <- full_join(
+      freq(temp_habitat) %>% 
+        mutate(resource = value) %>% 
+        dplyr::select(-c(value)) %>% 
+        rename("occupied" = "count"),
+      freq(temp_available) %>% 
+        mutate(resource = value) %>% 
+        dplyr::select(-c(value)) %>% 
+        rename("available" = "count"),
+      by = c("layer", "resource")
+    ) %>% 
+      mutate(
+        occupied = replace_na(occupied, 0),
+        prop.Occupied = round(occupied / sum(occupied), 4),
+        prop.Available = round(available / sum(available), 4),
+        propDiff = abs(prop.Occupied - prop.Available)
+      )
+    
+    # Calculate the most used habitat and round it to 4 decimal places
+    temp_res[1] <- temp_table %>% 
+      arrange(desc(occupied)) %>%
+      head(1) %>% 
+      pull(resource) %>% 
+      round(4)
+    
+    # Calculate habitat breadth (number of habitats occupied) and round it to 4 decimal places
+    temp_res[2] <- temp_table %>% 
+      summarise(sum(occupied != 0)) %>%
+      pull() %>% 
+      round(4)
+    
+    # Calculate Levins' measure of niche breadth and round it to 4 decimal places
+    temp_res[3] <- temp_table %>% 
+      summarise(1 / sum(prop.Occupied^2)) %>%
+      pull() %>% 
+      round(4)
+    
+    # Calculate normalized Levins' measure of niche breadth and round it to 4 decimal places
+    temp_res[4] <- temp_table %>% 
+      summarise(1 / (n() * sum(prop.Occupied^2))) %>%
+      pull() %>% 
+      round(4)
+    
+    # Calculate proportional similarity index and round it to 4 decimal places
+    temp_res[5] <- temp_table %>% 
+      summarise(1 - (0.5 * sum(propDiff))) %>%
+      pull() %>% 
+      round(4)
+    
+    # Create a list containing the species name and the calculated results
+    temp_res_list <- list(temp_spp, temp_res)
+    
+    # Return the list
+    return(temp_res_list)
+  },
+  error = function(e) {
+    # Handle errors by returning NA values
+    temp_res_list <- list(temp_spp, temp_res)
+    return(temp_res_list)
+  },
+  warning = function(w) {
+    # Handle warnings by returning NA values
+    temp_res_list <- list(temp_spp, temp_res)
+    return(temp_res_list)
+  })
+}
+
+
+# Setting up a cluster with 6 workers for parallel processing
+cl <- makeCluster(6)  # You may adjust the number of workers based on the available CPUs of your computer
+
+# Loading required libraries into the cluster workers
+clusterEvalQ(cl, {
+  library(dplyr)   # For data manipulation
+  library(tidyr)   # For data tidying
+  library(sf)      # For spatial data handling
+  library(terra)   # For raster data manipulation
+})
+
+# Exporting necessary objects to the cluster workers
+clusterExport(cl, c("rangeMaps",   # Assuming these are objects or functions needed for the computation
+                    "ecoregions",
+                    "spp_list",
+                    "habitatGeneralism_range"))
+
+# Applying a function called habitatGeneralism_range in parallel to each element of the spp_list
+# The function habitatGeneralism_range is applied across the workers using load balancing
+temp_res <- clusterApplyLB(cl, seq(1:length(spp_list)), habitatGeneralism_range)
+
+# Stopping the cluster to release system resources
+stopCluster(cl)
+
+
+
+### save data in  folder
+
+data.frame(scientificName_harmonise = unlist(purrr::map(temp_res, 1)),
+           do.call(rbind, purrr::map(temp_res, 2))) %>% 
+  rename("habitat_mostFreq" = "X1",
+         "habitatBreadth" = "X2",
+         "Levins" = "X3",
+         "Levins_norm" = "X4",
+         "PropSim" = "X5") %>% 
+  write_csv(".//habitatGeneralism.csv")
+```

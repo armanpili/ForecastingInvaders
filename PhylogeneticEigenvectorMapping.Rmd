@@ -1,0 +1,427 @@
+---
+title: "Phylogenetic Eigenvector Mapping"
+author: "XXXXXXXXXXXXXXXXXXXXXX"
+date: "`r format(Sys.time(), '%Y-%m-%d')`"
+output:
+  html_document:
+    df_print: paged
+    toc: true
+    toc_depth: 3
+    toc_float: true
+---
+
+
+```{r, results= "hide"}
+# software packages
+library(rmarkdown)
+library(parallel)
+library(doParallel)
+
+# data management
+library(taxize)
+
+# harmonising datasets
+library(AmphiNom)          # AmphiNom: Cleaning amphibian occurrence data
+
+# data wrangling and analysis
+library(tidyverse)
+library(naniar)
+
+
+# phylogenetic eigenvector mapping
+library(MPSEM)
+library(pez)
+
+# phylogenetic data wrangling and analysis
+library(ape)
+library(caper)
+library(treeio)
+library(tidytree)
+library(ggtree)
+library(phytools)
+
+library(miceRanger)
+library(DescTools)
+```
+
+This script was used to quantify the macroecological patterns of Amphibians. But the script is generally transferable to other taxa.
+
+Examples of the output files produced from this script can be downloaded in XXXXXXXXXXXXXXXXX.
+
+# upload data
+
+## phylogenetic tree
+
+Download the phylogenetic tree of your taxa. A nice resource is Timetree of life: https://timetree.org/
+Keep the tree in "./data/phylogeneticTree/" folder
+```{r}
+tree <- read.newick(file.choose())
+```
+
+### harmonise the tree taxonomy with that of your life-history and ecological traits dataset.
+
+
+```{r}
+# Convert 'tree' object to a tibble and replace underscores in 'label' column with spaces
+tree_table <- tree %>% 
+  as_tibble() %>%   # Convert 'tree' object to a tibble
+  mutate(label = str_replace_all(label, "_", " ")) 
+
+# Fetch corresponding names from Amphibian Species of the World (ASW) database
+temp <- aswSync(query = tree_table %>% pull(label))
+
+# Left join 'tree_table' with 'temp' on 'label' and 'query' columns
+tree_table <- tree_table %>% 
+  left_join(temp %>% 
+              dplyr::select(query, ASW_names),
+            by = c("label" = "query")) %>%   # Join based on 'label' and 'query' columns
+  # Create 'scientificName_harmonise' column, replacing NA values with original 'label'
+  mutate(scientificName_harmonise = if_else(is.na(ASW_names),
+                                      label,
+                                      ASW_names)) %>% # Replace NA values with original 'label' 
+  distinct(scientificName_harmonise, .keep_all = TRUE) %>%  
+  dplyr::select(parent,
+                node,
+                branch.length,
+                label = scientificName_harmonise) %>%   # Select necessary columns and rename 'label' column
+  filter(!is.na(label))   # Remove rows where 'label' is NA
+
+# Convert 'tree_table' back to a phylogenetic tree object
+tree <- tree_table %>% 
+  as.phylo(label = label)   # Convert back to a phylogenetic tree object
+
+```
+
+# upload your trait dataset
+
+For this example, upload the "./input/traits.csv"
+
+```{r}
+traits_60 <- read_csv(file.choose())  %>% 
+  mutate(withPhylo = scientificName_harmonise %in% pull(tree_table, label))
+```
+
+# Forward Step
+
+
+## phylogenetic tree
+
+```{r}
+# Drop duplicate rows based on the 'scientificName_harmonise' column
+temp_traits_subset <- traits_60 %>%  
+    distinct(scientificName_harmonise, .keep_all = TRUE) %>%   # Keep only distinct rows based on 'scientificName_harmonise'
+    as.data.frame()   # Convert to a data frame
+
+# Match species in the tree with those in 'temp_traits_subset'
+temp_spmatch <- match(tree$tip.label,
+                      temp_traits_subset$scientificName_harmonise)
+
+# Drop species from the tree that are not present in 'temp_traits_subset'
+temp_tree_subset <- drop.tip(tree,
+                             tree$tip.label[is.na(temp_spmatch)]) %>%   # Drop tips (species) based on NA matches
+  force.ultrametric()   # Force the tree to be ultrametric
+
+# Extract species that are in 'temp_traits_subset' but not in 'temp_tree_subset'
+spp_noPhylo <- temp_traits_subset %>% 
+  filter(!c(scientificName_harmonise %in% temp_tree_subset$tip.label)) %>%   # Filter out species not in 'temp_tree_subset'
+  pull(scientificName_harmonise)   # Extract 'scientificName_harmonise'
+
+# Impute missing species in the tree based on their congeneric relatives
+set.seed(7)   # Set random seed for reproducibility
+temp_tree_subset_impute <- congeneric.impute(temp_tree_subset,   # Impute missing species
+                                                spp_noPhylo,   # Species to impute
+                                                split = " ")   # Split species names
+
+```
+
+## Build a Phylogenetic Eigenvector Map (PEM)
+
+```{r}
+temp_tree_subset_impute_graph <- Phylo2DirectedGraph(temp_tree_subset_impute)
+
+# fixed the function because I hit snags in the phylogenetic tree
+
+PEM.build.fixed <- function (x, d = "distance", sp = "species", a = 0, psi = 1, 
+    tol = .Machine$double.eps^0.5) 
+{
+    if (attr(x, "class") != "graph") 
+        stop("Parameter 'x' must be of class 'graph'")
+    if (is.null(x$edge[[d]])) 
+        stop("There is no property '", d, "' to be used as edges lengths.")
+    if (is.null(x$vertex[[sp]])) 
+        stop("There is no property '", sp, "' to indicate species vertices.")
+  
+nsp <- sum(x$vertex[[sp]])
+
+ev <- as.integer(attr(x, "ev"))
+
+a <- rep(a, length.out = ev[1L])
+
+psi <- rep(psi, length.out = ev[1L])
+
+out <- list(x = x, sp = x$vertex[[sp]])
+
+
+out[["B"]] <- matrix(.C("PEMInfMat", as.integer(x$edge[[1L]]), 
+        as.integer(x$edge[[2L]]), ev[1L], ev[2L], B = integer(ev[2L] * 
+            ev[1L]))$B, ev[2L], ev[1L])[x$vertex[[sp]], ]
+
+out <- c(out, .C("PEMbuildC", ne = ev[1L], nsp = nsp, Bc = as.double(out$B), 
+        means = double(ev[1L]), dist = as.double(x$edge[[d]]), 
+        a = as.double(a), psi = as.double(psi), w = double(ev[1L]), 
+        BcW = double(nsp * ev[1L])))
+
+attr(out$Bc, "dim") <- c(nsp, ev[1L])
+
+attr(out$BcW, "dim") <- c(nsp, ev[1L])
+
+
+dimnames(out$Bc) <- dimnames(out$BcW) <- list(attr(x, "vlabel")[x$vertex[[sp]]], 
+        attr(x, "elabel"))
+
+temp <- as.data.frame(out$BcW) %>% 
+  dplyr::select(-c(names(which(colSums(is.na(out$BcW)) >0)))) %>% 
+  as.matrix()
+
+out <- c(out, La.svd(temp, nsp, nsp))
+
+sel <- out$d >= tol
+out$d <- out$d[sel]
+out$u <- out$u[, sel, drop = FALSE]
+out$vt <- out$vt[sel, , drop = FALSE]
+rownames(out$vt) <- colnames(out$u) <- paste("V", 1L:sum(sel), 
+                                             sep = "_")
+rownames(out$u) <- attr(x, "vlabel")[x$vertex[[sp]]]
+
+#colnames(out$vt) <- attr(x, "elabel")
+attr(out, "class") <- "PEM"
+ return(out)
+}
+
+
+
+# Build a Phylogenetic Eigenvector Map (PEM)
+
+temp_tree_subset_impute_pem <- PEM.build.fixed(
+  x = temp_tree_subset_impute_graph,   # Input graph object for PEM construction
+  d = "distance",   # Specify the type of distance ('distance' here)
+  sp = "species",   # Specify the type of node attributes (species names)
+  a = 0,   # Specify parameter 'a' (weighting parameter; set to 0 here)
+  psi = 1   # Specify parameter 'psi' (proximity decay; set to 1 here)
+)
+
+
+# retrieve the first 100 Phylogenetic eigenvectors
+
+pem_df <- as.data.frame(temp_tree_subset_impute_pem) %>% 
+  rownames_to_column() %>% 
+  rename("scientificName_harmonise" = "rowname")
+```
+
+```{r}
+# join the PEM data frame to the traits data
+
+traits_60_wpem <- traits_60 %>% 
+  left_join(pem_df, by = "scientificName_harmonise") %>% 
+  filter(!is.na(V_1)) %>% 
+  select(-c(scientificName,
+            scientificName_harmonise,
+            Order,
+            withPhylo,
+            Genus,
+            id)) %>%
+  droplevels() %>% 
+  as.data.frame()
+```
+
+# save the traits_60 and PEM
+
+save this in "./input/" folder
+
+```{r}
+write.csv(traits_60 %>% 
+  left_join(pem_df, by = "scientificName_harmonise") %>% 
+  filter(!is.na(V_1)) %>% 
+  select(-c(...1,
+            id)) %>%
+  droplevels() %>% 
+  as.data.frame(),
+          "./input/traits_wPEM.csv")
+```
+
+
+# Forward-step selection of phylogenetic eigenvectors
+
+## miceRanger
+
+fine-tune the optimal number of phylogenetic eigenvectors to imput a trait. Here is an example code for 1 trat : "Fos" or "fossorial substrate"
+
+This code performs the following tasks:
+
+1. Generates a test dataset with 20% missing values in the column "Fos".
+2. Creates a shadow dataset for imputation.
+3. Iterates through 100 iterations.
+4. Imputes missing values using the miceRanger algorithm.
+5. Computes out-of-bag errors and stores them.
+6. Imputes missing values in the test dataset.
+7. Computes R2 correlations between observed and imputed values and stores them.
+
+
+
+
+```{r}
+
+traits_60_wpem <- traits_60 %>% 
+  left_join(pem_df, by = "scientificName_harmonise") %>% 
+  filter(!is.na(V_1)) %>% 
+  select(-c(scientificName,
+            scientificName_harmonise,
+            Order,
+            withPhylo,
+            Genus,
+            id)) %>%
+  droplevels() %>% 
+  as.data.frame()
+
+
+# Create empty data frames to store out-of-bag errors and correlations
+oob_error_df <- data.frame()   # Data frame to store out-of-bag errors
+cor_eig_df <- data.frame()   # Data frame to store correlations
+
+n_v <- sum(grepl(pattern = "V_", names(traits_60_wpem)))
+
+# Set random seed for reproducibility
+set.seed(7)
+
+# Generate a test dataset with 20% missing values in the column "Fos"
+imp_test <- amputeData(
+  data = traits_60_wpem,   # Input dataset
+  perc = 0.2,   # Percentage of missing values
+  cols = "Fos"   # Column to induce missingness
+)
+
+# Create a shadow dataset for imputation
+imp_test_shadow <- imp_test %>% 
+  bind_shadow()
+
+# Initialize lists to store correlations and out-of-bag errors
+cor_Fos <- list()
+oob_Fos <- list()
+
+# Iterate through N iterations equivaent to number of eigenvectors
+for (i in 1:n_v) {
+  message(paste0("running V_1 to V_", i))
+  v_x <- 14 + i   # the start of the eigenvectors column
+  v <- list(Fos = c(names(traits_60_wpem)[c(4:v_x)]))   # Define the list of variables to include as predictors of FOS; FOS is the 3rd column, so everything after that.
+  
+  # Set up parallel computing
+  cl <- makeCluster(5)   # Create a cluster with 5 nodes
+  registerDoParallel(cl)   # Register the cluster for parallel processing
+  
+  # Impute missing values using miceRanger algorithm
+  imp_model <- miceRanger(
+    data = traits_60_wpem,   # Input dataset
+    m = 10,   # Number of trees in the forest
+    maxiter = 5,   # Maximum number of iterations
+    vars = v,   # List of variables to impute
+    valueSelector = "meanMatch",   # Method for selecting imputation values
+    verbose = FALSE,   # Suppress verbose output
+    parallel = TRUE,   # Enable parallel processing
+    returnModels = TRUE   # Return imputation models
+  )
+  
+  stopCluster(cl)   # Stop the cluster after imputation
+  
+  oob_Fos[[i]] <- pull(imp_model$finalError, Fos)   # Store out-of-bag errors
+  
+  # Impute missing values in the test dataset
+  imp_test_imp <- impute(
+    data = imp_test,   # Test dataset
+    miceObj = imp_model,   # Imputation models
+    verbose = FALSE   # Suppress verbose output
+  )
+  
+  # Compute R2 correlations
+  temp_df <- data.frame()
+  for (j in paste0("Dataset_", 1:10)) {
+    temp <- data.frame(
+      imp = pull(imp_test_imp$imputedData[[j]], Fos),   # Imputed values
+      imp_NA = pull(imp_test_shadow, Fos_NA),   # Missingness indicator in imputed dataset
+      obs = pull(traits_60_wpem_shadow, Fos),   # Observed values
+      obs_NA = pull(traits_60_wpem_shadow, Fos_NA),   # Missingness indicator in observed dataset
+      dataset = j   # Dataset identifier
+    ) %>% 
+      filter(obs_NA == "!NA", imp_NA == "NA")   # Filter non-missing values
+    
+    temp_df <- rbind(temp_df, temp)   # Bind the results into a data frame
+  }
+  
+  # Compute correlations and store them
+  cor_Fos[[i]] <- temp_df %>% 
+    group_by(dataset) %>%
+    mutate(
+      imp = as.numeric(imp),   # Convert imputed values to numeric
+      obs = as.numeric(obs)   # Convert observed values to numeric
+    ) %>% 
+    summarise(cor = Lambda(obs, imp)) %>%   # Compute correlation
+    pull(cor)   # Extract correlation values
+}
+
+```
+
+Summaries out-of-bag errors and then creates a plot of mean out-of-bag errors with error bars representing the standard deviation.
+
+```{r}
+# Create a summary data frame for out-of-bag errors
+oob_Fos_summary <- data.frame(do.call(rbind, oob_Fos)) %>%   # Combine out-of-bag errors into a data frame
+  mutate(v = seq(1, n_v, 1)) %>%   # Add a sequence of numbers from 1 to 100 as a new column 'v'
+  pivot_longer(cols = X1:X10,    # Reshape data from wide to long format
+               names_to = "rep",   # New column name for replicate number
+               values_to = "oob") %>%   # New column name for out-of-bag error
+  group_by(v) %>%   # Group data by the sequence number 'v'
+  summarise(mean_oob = mean(oob),   # Calculate the mean out-of-bag error for each 'v'
+            sd_oob = sd(oob))   # Calculate the standard deviation of out-of-bag errors for each 'v'
+
+# Select the row with the highest mean out-of-bag error
+oob_Fos_summary %>% 
+  arrange(desc(mean_oob)) %>%   # Arrange rows in descending order of mean out-of-bag error
+  slice(1)   # Select the first row (highest mean out-of-bag error)
+
+# Plot mean out-of-bag errors with error bars
+oob_Fos_summary %>% 
+  ggplot() +   # Start a ggplot object
+  geom_pointrange(aes(x = v,   # X-axis: sequence number 'v'
+                      y = mean_oob,   # Y-axis: mean out-of-bag error
+                      ymin = mean_oob - sd_oob,   # Lower error bar: mean - standard deviation
+                      ymax = mean_oob + sd_oob)) +   # Upper error bar: mean + standard deviation
+  theme_bw()   # Apply a black and white theme
+
+```
+
+
+
+```{r}
+# Create a summary data frame for R2 correlations
+cor_Fos_summary <- data.frame(do.call(rbind, cor_Fos)) %>%   # Combine R2 correlations into a data frame
+  mutate(v = seq(1, n_v, 1)) %>%   # Add a sequence of numbers from 1 to 100 as a new column 'v'
+  pivot_longer(cols = X1:X10,    # Reshape data from wide to long format
+               names_to = "rep",   # New column name for replicate number
+               values_to = "cor") %>%   # New column name for R2 correlation
+  mutate(cor = cor^2) %>%   # Square the R2 correlation values
+  group_by(v) %>%   # Group data by the sequence number 'v'
+  summarise(mean_cor = mean(cor),   # Calculate the mean R2 correlation for each 'v'
+            sd_cor = sd(cor))   # Calculate the standard deviation of R2 correlations for each 'v'
+
+# Plot mean R2 correlations with error bars
+cor_Fos_summary %>% 
+  ggplot() +   # Start a ggplot object
+  geom_pointrange(aes(x = v,   # X-axis: sequence number 'v'
+                      y = mean_cor,   # Y-axis: mean R2 correlation
+                      ymin = mean_cor - sd_cor,   # Lower error bar: mean - standard deviation
+                      ymax = mean_cor + sd_cor)) +   # Upper error bar: mean + standard deviation
+  theme_bw()   # Apply a black and white theme
+
+```
+
+
+
